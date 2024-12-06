@@ -3,7 +3,7 @@ When training LLMs, it is very important to make sure that you don't have toxic 
 
 This repo has 3 main modules:
 
-- A data labeling script, that uses the GCP Cloud Natural Langage API to rate a subsample of the dataset
+- A data labeling script, that uses the GCP Cloud Natural Language API to rate a subsample of the dataset
 - A fine tuning script that takes the annotated data and fine tunes a classifier
 - An inference script, that takes a trained model and performs distributed inference over a dataset
 
