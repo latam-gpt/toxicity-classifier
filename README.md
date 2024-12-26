@@ -3,7 +3,7 @@ When training LLMs, it is very important to make sure that you don't have toxic 
 
 This repo has 3 main modules:
 
-- A data labeling script, that uses the GCP Cloud Natural Langage API to rate a subsample of the dataset
+- A data labeling script, that uses the GCP Cloud Natural Language API to rate a subsample of the dataset
 - A fine tuning script that takes the annotated data and fine tunes a classifier
 - An inference script, that takes a trained model and performs distributed inference over a dataset
 
@@ -46,7 +46,9 @@ Finally, for distributed inference over your entire dataset, you have the `infer
 python inference.py --model_path <path_to_model> \
                     --dataset_path <path_to_dataset> \
                     --output_path <output_file_path> \
-                    --text_column <text_column_name>
+                    --text_column <text_column_name> \
+                    --batch_size <batch_size> \
+                    --procs_per_gpu <procs_per_gpu>
 ```
 
 Getting a new dataset with your model's predictions.

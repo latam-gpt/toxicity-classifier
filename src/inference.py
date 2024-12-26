@@ -1,33 +1,26 @@
 import argparse
-from multiprocessing import Manager, Process
-from multiprocessing.managers import DictProxy
 
 import torch
-from datasets import Dataset, load_from_disk
+from datasets import load_from_disk
 from transformers import pipeline
 
 
 def classify_toxicity(
-    data_slice: Dataset,
-    device_id: int,
-    results_dict: DictProxy,
-    idx: int,
-    model_path: str,
-    text_column: str,
-) -> None:
+    batch: dict, model_path: str, device_id: int, text_column: str, batch_size: int
+) -> dict:
     """
-    Realiza inferencia de toxicidad en una partición del dataset usando una GPU
-    específica.
+    Realiza inferencia sobre un batch de datos utilizando una pipeline de Hugging Face.
 
     Args:
-        data_slice (Dataset): Subconjunto del dataset a procesar.
-        device_id (int): ID de la GPU asignada.
-        results_dict (DictProxy): Diccionario compartido para almacenar los resultados.
-        idx (int): Índice del proceso.
-        model_path (str): Ruta del modelo de clasificación de toxicidad.
-        text_column (str): Nombre de la columna de texto del dataset.
+        batch (dict): Diccionario que contiene un batch del dataset.
+        model_path (str): Ruta al modelo preentrenado.
+        device_id (int): ID de la GPU a usar.
+        text_column (str): Nombre de la columna que contiene los textos.
+        batch_size (int): Tamaño del batch.
+
+    Returns:
+        dict: Diccionario con las etiquetas de toxicidad y las puntuaciones.
     """
-    print(f"Inicializando proceso {idx} en dispositivo {device_id}")
     toxicity_classifier = pipeline(
         "text-classification",
         model=model_path,
@@ -36,18 +29,41 @@ def classify_toxicity(
         truncation=True,
         max_length=512,
     )
-    textos = [
-        text.replace("_usr", "").replace("_url", "") for text in data_slice[text_column]
-    ]
-
-    results = toxicity_classifier(textos, batch_size=16)
-    labels = [res for res in results]
-
-    results_dict[idx] = labels
+    texts = batch[text_column]
+    results = toxicity_classifier(texts, batch_size=batch_size)
+    labels = [res["label"] for res in results]
+    scores = [res["score"] for res in results]
+    return {"toxicity_label": labels, "toxicity_score": scores}
 
 
-def main() -> None:
-    """Función principal del script."""
+def process_batch(
+    batch: dict,
+    model_path: str,
+    text_column: str,
+    batch_size: int,
+    process_index: int,
+    num_gpus: int,
+) -> dict:
+    """
+    Procesa un batch de datos asignando una GPU en función del índice del proceso.
+
+    Args:
+        batch (dict): Diccionario que contiene un batch del dataset.
+        model_path (str): Ruta al modelo preentrenado.
+        text_column (str): Nombre de la columna que contiene los textos.
+        batch_size (int): Tamaño del batch.
+        process_index (int): Índice del proceso actual.
+        num_gpus (int): Número de GPUs disponibles.
+
+    Returns:
+        dict: Diccionario con las etiquetas de toxicidad y las puntuaciones.
+    """
+    device_id = process_index % num_gpus
+    return classify_toxicity(batch, model_path, device_id, text_column, batch_size)
+
+
+def main():
+    """Función principal."""
     parser = argparse.ArgumentParser(
         description="Clasificación de toxicidad en paralelo usando GPUs."
     )
@@ -57,7 +73,7 @@ def main() -> None:
         help="Ruta al modelo de clasificación de toxicidad.",
     )
     parser.add_argument(
-        "--dataset_path", required=True, help="Ruta al dataset de entrada."
+        "--dataset_path", required=True, help="Ruta al dataset por etiquetar."
     )
     parser.add_argument(
         "--output_path", required=True, help="Ruta para guardar el dataset etiquetado."
@@ -67,12 +83,25 @@ def main() -> None:
         required=True,
         help="Nombre de la columna de texto del dataset.",
     )
+    parser.add_argument(
+        "--batch_size",
+        required=True,
+        help="Tamaño del batch.",
+    )
+    parser.add_argument(
+        "--procs_per_gpu",
+        type=int,
+        default=2,
+        help="Número de procesos por GPU.",
+    )
     args = parser.parse_args()
 
     model_path = args.model_path
     dataset_path = args.dataset_path
     output_path = args.output_path
     text_column = args.text_column
+    batch_size = int(args.batch_size)
+    procs_per_gpu = int(args.procs_per_gpu)
 
     dataset = load_from_disk(dataset_path)
     print("Dataset cargado")
@@ -81,41 +110,20 @@ def main() -> None:
     if num_gpus == 0:
         raise RuntimeError("No se encontraron GPUs disponibles.")
 
-    shard_size = len(dataset) // num_gpus
-    dataset_slices = [
-        dataset.select(range(i * shard_size, (i + 1) * shard_size))
-        for i in range(num_gpus)
-    ]
-    if len(dataset) % num_gpus != 0:
-        dataset_slices[-1] = dataset.select(
-            range((num_gpus - 1) * shard_size, len(dataset))
-        )
+    total_procs = num_gpus * procs_per_gpu
 
-    with Manager() as manager:
-        results_dict = manager.dict()
-        processes = []
+    results = dataset.map(
+        lambda batch, process_index: process_batch(
+            batch, model_path, text_column, batch_size, process_index, num_gpus
+        ),
+        batched=True,
+        batch_size=batch_size,
+        num_proc=total_procs,
+        with_rank=True,
+    )
 
-        for i in range(num_gpus):
-            process = Process(
-                target=classify_toxicity,
-                args=(dataset_slices[i], i, results_dict, i, model_path, text_column),
-            )
-            processes.append(process)
-            process.start()
-
-        for process in processes:
-            process.join()
-
-        final_labels = []
-        for i in range(num_gpus):
-            final_labels.extend(results_dict[i])
-
-        final_dataset = Dataset.from_dict(
-            {"texto": dataset["texto"], "toxicity_label": final_labels}
-        )
-
-        final_dataset.save_to_disk(output_path)
-        print(f"Dataset etiquetado guardado en: {output_path}")
+    results.save_to_disk(output_path)
+    print(f"Dataset etiquetado guardado en: {output_path}")
 
 
 if __name__ == "__main__":
